@@ -37,6 +37,10 @@ unifies ripgrep, BM25, and vector search behind
 [one local-first interface](./docs/05-architecture.md). Use it directly from the
 terminal, or let your agent use it for you.
 
+This README and the [documentation](./docs/README.md) describe the TypeScript /
+Node.js implementation. The Rust implementation is developed separately in
+[`rust/`](./rust/README.md).
+
 <a id="tour"></a>
 
 ## 🎬 See it in action

@@ -2,6 +2,11 @@
 
 Thank you for helping make zvec-grep better.
 
+This guide covers the TypeScript / Node.js implementation at the repository root.
+For the Rust workspace in `rust/`, see the [Rust contributor guide](rust/CONTRIBUTING.md).
+The two implementations have separate CI workflows; changes affecting both should
+run both sets of checks.
+
 ## Development setup
 
 zvec-grep requires Node.js 22 or newer.

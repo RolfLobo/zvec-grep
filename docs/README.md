@@ -9,6 +9,9 @@ interfaces.
 > zvec-grep is a work in progress. Commands and configuration may change before
 > the first stable release.
 
+These guides describe the TypeScript / Node.js implementation. For Rust development
+and implementation details, see the [Rust README](../rust/README.md).
+
 ## Start here
 
 | I want to… | Read |

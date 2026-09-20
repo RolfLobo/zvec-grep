@@ -36,6 +36,9 @@
 将 ripgrep、BM25 与向量检索统一在一个[本地优先的检索入口](./docs/05-architecture.md)中。
 既可以由人在终端中搜索，也可以让 Agent 根据问题选择合适的本地检索方式。
 
+本 README 和[使用文档](./docs/README.md)以 TypeScript / Node.js 实现为主。
+Rust 实现位于独立的 [`rust/`](./rust/README.md) 目录。
+
 <a id="tour"></a>
 
 ## 🎬 功能演示

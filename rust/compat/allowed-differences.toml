@@ -1,0 +1,14 @@
+# TypeScript/Rust differences are forbidden unless listed here with an owner,
+# reason and removal condition.
+
+[[difference]]
+id = "watcher-same-path-last-event-wins"
+owner = "watcher/scanner"
+reason = "修复 TypeScript ChangeSet 在 delete 后同路径 recreate 被旧删除事件吞掉的问题；同一路径按事件到达顺序以后到事件为准。"
+removal_condition = "TypeScript 兼容层退役，或 TypeScript 实现采用相同语义。"
+
+[[difference]]
+id = "filesystem-root-containment"
+owner = "watcher/scanner"
+reason = "Rust 使用路径组件判断包含关系，修复 TypeScript 对文件系统根目录执行字符串前缀判断时无法识别子路径的问题。"
+removal_condition = "TypeScript 兼容层退役，或 TypeScript 实现改用路径组件判断。"
