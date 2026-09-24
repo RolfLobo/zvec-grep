@@ -5,12 +5,16 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Sequence
+
+from zg_bench.core.protocol import JUDGE_MODELS
+from zg_bench.reports.aggregate import aggregate_reports
 
 from . import SweQaError
 from .collect import collect_pair
-from .judge import aggregate_reports, judge_pairs
+from .judge import judge_pairs
+from .selection import CI_SCOPES, matrix_outputs
 from .validation import validate_assets
 
 
@@ -28,6 +32,10 @@ def _parser() -> argparse.ArgumentParser:
     validate.add_argument("--references", type=Path, required=True)
     validate.add_argument("--dataset", type=Path, required=True)
 
+    matrix = commands.add_parser("matrix", help="select the locked CI task scope")
+    matrix.add_argument("--selection", type=Path, required=True)
+    matrix.add_argument("--scope", choices=CI_SCOPES, required=True)
+
     collect = commands.add_parser("collect", help="collect one Harbor profile pair")
     collect.add_argument("--runs-dir", type=Path, required=True)
     collect.add_argument("--task", required=True)
@@ -40,6 +48,7 @@ def _parser() -> argparse.ArgumentParser:
     judge.add_argument("--output-dir", type=Path, required=True)
     judge.add_argument("--expected", nargs="+", action="append", required=True)
     judge.add_argument("--attempts", type=int, default=3)
+    judge.add_argument("--model", choices=JUDGE_MODELS, default="glm-5.2")
 
     aggregate = commands.add_parser(
         "aggregate", help="combine already judged per-task reports"
@@ -47,6 +56,11 @@ def _parser() -> argparse.ArgumentParser:
     aggregate.add_argument("--reports-root", type=Path, required=True)
     aggregate.add_argument("--output-dir", type=Path, required=True)
     aggregate.add_argument("--expected", nargs="+", action="append")
+    aggregate.add_argument(
+        "--allow-missing",
+        action="store_true",
+        help="aggregate completed task reports and record missing expected tasks",
+    )
     return parser
 
 
@@ -60,6 +74,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 dataset_path=args.dataset,
             )
             print(json.dumps(result, ensure_ascii=False))
+        elif args.command == "matrix":
+            print(matrix_outputs(args.selection, args.scope), end="")
         elif args.command == "collect":
             pair = collect_pair(
                 runs_dir=args.runs_dir,
@@ -86,6 +102,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 output_dir=args.output_dir,
                 expected=expected,
                 attempts=args.attempts,
+                model=args.model,
             )
             print(
                 json.dumps(
@@ -105,6 +122,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 reports_root=args.reports_root,
                 output_dir=args.output_dir,
                 expected=expected,
+                allow_missing=args.allow_missing,
             )
             print(
                 json.dumps(

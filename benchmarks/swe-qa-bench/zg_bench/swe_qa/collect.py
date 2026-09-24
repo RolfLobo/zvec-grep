@@ -8,19 +8,16 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from . import SweQaError
-
-PROFILES = ("baseline", "zvec-grep")
-
-
-def _load_json(path: Path, *, label: str) -> dict[str, Any]:
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise SweQaError(f"could not read {label} {path}: {error}") from error
-    if not isinstance(value, dict):
-        raise SweQaError(f"{label} must contain a JSON object: {path}")
-    return value
+from zg_bench.core.errors import SweQaError
+from zg_bench.core.io import load_object
+from zg_bench.core.protocol import PROFILE_NAMES as PROFILES
+from zg_bench.metrics.numbers import require_number, same_metric
+from zg_bench.metrics.usage import (
+    LEGACY_USAGE_SCOPE,
+    SESSION_USAGE_SCOPE,
+    compatible_usage_scope,
+    validate_session_usage,
+)
 
 
 def _task_slug(task: str) -> str:
@@ -67,7 +64,7 @@ def _job_dirs(runs_dir: Path, profile: str) -> list[Path]:
 
 
 def _completed_job(job_dir: Path, *, expected_trials: int) -> dict[str, Any]:
-    result = _load_json(job_dir / "result.json", label="Harbor job result")
+    result = load_object(job_dir / "result.json", label="Harbor job result")
     if not result.get("finished_at"):
         raise SweQaError(f"Harbor job did not finish: {job_dir.name}")
     total = result.get("n_total_trials")
@@ -82,9 +79,7 @@ def _completed_job(job_dir: Path, *, expected_trials: int) -> dict[str, Any]:
     completed = stats.get("n_completed_trials")
     errors = stats.get("n_errored_trials")
     if completed != total or errors not in (0, None):
-        raise SweQaError(
-            f"Harbor job has incomplete or errored trials: {job_dir.name}"
-        )
+        raise SweQaError(f"Harbor job has incomplete or errored trials: {job_dir.name}")
     return result
 
 
@@ -97,7 +92,7 @@ def _select_trials(
         result_path = trial_dir / "result.json"
         if not result_path.is_file():
             continue
-        result = _load_json(result_path, label="Harbor trial result")
+        result = load_object(result_path, label="Harbor trial result")
         if _matches_task(result, task):
             matches.append((trial_dir, result))
 
@@ -117,36 +112,13 @@ def _select_trials(
         trial_name = str(result.get("trial_name") or trial_dir.name)
         return started, trial_name
 
-    matches.sort(
-        key=execution_order
-    )
+    matches.sort(key=execution_order)
     if len(matches) != expected_trials:
         raise SweQaError(
             f"expected exactly {expected_trials} completed trial(s) for {task!r} in "
             f"{job_dir.name}, found {len(matches)}"
         )
     return matches
-
-
-def _number(
-    value: Any,
-    *,
-    label: str,
-    integer: bool = False,
-    allow_none: bool = False,
-    positive: bool = False,
-) -> int | float | None:
-    if value is None and allow_none:
-        return None
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise SweQaError(f"{label} is missing or is not numeric")
-    if integer and not isinstance(value, int):
-        raise SweQaError(f"{label} must be an integer")
-    if not math.isfinite(float(value)) or value < 0:
-        raise SweQaError(f"{label} must be finite and non-negative")
-    if positive and value == 0:
-        raise SweQaError(f"{label} must be positive")
-    return value
 
 
 def _parse_time(value: Any, *, label: str) -> datetime:
@@ -199,6 +171,50 @@ def _trajectory_metrics(trajectory: dict[str, Any]) -> dict[str, Any]:
     return {"answer": answer, "tool_calls": tool_calls}
 
 
+def _session_usage_for_trial(
+    trial_dir: Path, result: dict[str, Any], context: dict[str, Any]
+) -> dict[str, Any] | None:
+    configs = [result.get("config", {})]
+    config_path = trial_dir / "config.json"
+    if config_path.is_file():
+        configs.append(load_object(config_path, label="Harbor trial config"))
+    required = False
+    for config in configs:
+        if not isinstance(config, dict):
+            continue
+        agent = config.get("agent", {})
+        kwargs = agent.get("kwargs", {}) if isinstance(agent, dict) else {}
+        flag = kwargs.get("collect_session_usage") if isinstance(kwargs, dict) else None
+        if flag is not None and not isinstance(flag, bool):
+            raise SweQaError("collect_session_usage must be a boolean")
+        required = required or flag is True
+    metadata = context.get("metadata")
+    if isinstance(metadata, dict) and metadata.get("session_usage") is not None:
+        required = True
+    path = trial_dir / "agent" / "session-usage.json"
+    if not required and not path.exists():
+        return None
+    usage = validate_session_usage(
+        load_object(path, label="required session usage"), require_identity=True
+    )
+    for context_key, usage_key in (
+        ("n_input_tokens", "input_tokens"),
+        ("n_output_tokens", "output_tokens"),
+        ("cost_usd", "cost_usd"),
+    ):
+        if not same_metric(context.get(context_key), usage["total"][usage_key]):
+            raise SweQaError(f"AgentContext {context_key} disagrees with session usage")
+    cache_tokens = (
+        usage["total"]["cache_read_tokens"] + usage["total"]["cache_write_tokens"]
+    )
+    if not same_metric(context.get("n_cache_tokens"), cache_tokens):
+        raise SweQaError("AgentContext n_cache_tokens disagrees with session usage")
+    require_number(
+        usage.get("collection_wall_seconds"), label="session usage collection time"
+    )
+    return usage
+
+
 def _profile_result(
     *,
     profile: str,
@@ -208,9 +224,7 @@ def _profile_result(
     trial_index: int,
 ) -> dict[str, Any]:
     if result.get("exception_info") is not None:
-        raise SweQaError(
-            f"{profile} trial ended with an exception: {trial_dir.name}"
-        )
+        raise SweQaError(f"{profile} trial ended with an exception: {trial_dir.name}")
     if not result.get("finished_at"):
         raise SweQaError(f"{profile} trial did not finish: {trial_dir.name}")
     verifier = result.get("verifier_result")
@@ -218,9 +232,7 @@ def _profile_result(
         raise SweQaError(f"{profile} trial is missing verifier result")
     rewards = verifier.get("rewards")
     if not isinstance(rewards, dict) or not any(
-        isinstance(value, (int, float))
-        and not isinstance(value, bool)
-        and value > 0
+        isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0
         for value in rewards.values()
     ):
         raise SweQaError(f"{profile} trial has no positive verifier reward")
@@ -228,19 +240,19 @@ def _profile_result(
     context = result.get("agent_result")
     if not isinstance(context, dict):
         raise SweQaError(f"{profile} trial is missing agent result")
-    input_tokens = _number(
+    input_tokens = require_number(
         context.get("n_input_tokens"),
         label=f"{profile} input_tokens",
         integer=True,
         positive=True,
     )
-    output_tokens = _number(
+    output_tokens = require_number(
         context.get("n_output_tokens"),
         label=f"{profile} output_tokens",
         integer=True,
         positive=True,
     )
-    cost_usd = _number(
+    cost_usd = require_number(
         context.get("cost_usd"),
         label=f"{profile} cost_usd",
         allow_none=True,
@@ -249,9 +261,7 @@ def _profile_result(
     timing = result.get("agent_execution")
     if not isinstance(timing, dict):
         raise SweQaError(f"{profile} trial is missing agent execution timing")
-    started = _parse_time(
-        timing.get("started_at"), label=f"{profile} agent start time"
-    )
+    started = _parse_time(timing.get("started_at"), label=f"{profile} agent start time")
     finished = _parse_time(
         timing.get("finished_at"), label=f"{profile} agent finish time"
     )
@@ -262,10 +272,37 @@ def _profile_result(
     if not math.isfinite(wall_seconds) or wall_seconds <= 0:
         raise SweQaError(f"{profile} agent execution time must be positive")
 
-    trajectory = _load_json(
+    trajectory = load_object(
         trial_dir / "agent" / "trajectory.json", label="agent trajectory"
     )
     trajectory_values = _trajectory_metrics(trajectory)
+    session_usage = _session_usage_for_trial(trial_dir, result, context)
+    usage_metrics: dict[str, Any] = {"usage_scope": LEGACY_USAGE_SCOPE}
+    if session_usage is not None:
+        collection_seconds = session_usage["collection_wall_seconds"]
+        wall_seconds -= collection_seconds
+        if wall_seconds <= 0:
+            raise SweQaError(
+                "session usage collection time exceeds agent execution time"
+            )
+        usage_metrics = {
+            **session_usage["total"],
+            "usage_scope": SESSION_USAGE_SCOPE,
+            "usage_collection_wall_seconds": collection_seconds,
+            "session_usage": {
+                key: session_usage[key]
+                for key in (
+                    "schema_version",
+                    "scope",
+                    "complete",
+                    "root_session_id",
+                    "root",
+                    "descendants",
+                    "total",
+                    "collection_wall_seconds",
+                )
+            },
+        }
     model_info = result.get("agent_info")
     model_name: str | None = None
     if isinstance(model_info, dict):
@@ -285,6 +322,7 @@ def _profile_result(
         "tool_calls": trajectory_values["tool_calls"],
         "agent_wall_seconds": wall_seconds,
         "cost_usd": cost_usd,
+        **usage_metrics,
     }
 
 
@@ -309,16 +347,12 @@ def collect_pair(
     profiles: dict[str, Any] = {}
     for profile in PROFILES:
         job_dirs = _job_dirs(runs_dir, profile)
-        matching_jobs: list[
-            tuple[Path, list[tuple[Path, dict[str, Any]]]]
-        ] = []
+        matching_jobs: list[tuple[Path, list[tuple[Path, dict[str, Any]]]]] = []
         errors: list[SweQaError] = []
         for job_dir in job_dirs:
             try:
                 _completed_job(job_dir, expected_trials=expected_trials)
-                trials = _select_trials(
-                    job_dir, task, expected_trials=expected_trials
-                )
+                trials = _select_trials(job_dir, task, expected_trials=expected_trials)
             except SweQaError as error:
                 errors.append(error)
                 continue
@@ -348,6 +382,9 @@ def collect_pair(
             "trials": trial_results,
         }
 
+    usage_scope = compatible_usage_scope(
+        [trial for profile in profiles.values() for trial in profile["trials"]]
+    )
     pair = {
         "schema_version": 2,
         "task_id": task,
@@ -356,6 +393,7 @@ def collect_pair(
         "expected_trials": expected_trials,
         "actual_trials": expected_trials,
         "profiles": profiles,
+        "usage_scope": usage_scope,
     }
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(
