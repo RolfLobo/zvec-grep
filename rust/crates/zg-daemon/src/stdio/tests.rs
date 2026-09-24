@@ -18,7 +18,7 @@ use tokio::{
     task::JoinHandle,
 };
 
-use super::{relay, same_daemon};
+use super::{StdioBridgeStopCheck, relay, same_daemon};
 use crate::{DaemonError, DaemonStatus};
 
 struct SendAttempt {
@@ -160,6 +160,29 @@ fn daemon_identity_requires_the_same_running_process_and_url() {
     stopped.running = false;
     stopped.ready = false;
     assert!(!same_daemon(&connected, &stopped));
+}
+
+#[test]
+fn stop_check_tolerates_two_missing_polls_and_recovers() {
+    let connected = status(10, "http://127.0.0.1:7999/mcp");
+    let stopped = DaemonStatus::default();
+    let mut check = StdioBridgeStopCheck::default();
+
+    assert!(!check.should_stop(&connected, &stopped));
+    assert!(!check.should_stop(&connected, &stopped));
+    assert!(!check.should_stop(&connected, &connected));
+    assert!(!check.should_stop(&connected, &stopped));
+    assert!(!check.should_stop(&connected, &stopped));
+    assert!(check.should_stop(&connected, &stopped));
+}
+
+#[test]
+fn stop_check_rejects_a_different_live_daemon_immediately() {
+    let connected = status(10, "http://127.0.0.1:7999/mcp");
+    let replacement = status(11, "http://127.0.0.1:7999/mcp");
+    let mut check = StdioBridgeStopCheck::default();
+
+    assert!(check.should_stop(&connected, &replacement));
 }
 
 #[tokio::test]

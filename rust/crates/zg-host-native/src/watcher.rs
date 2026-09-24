@@ -142,7 +142,13 @@ impl WorkspaceWatcherFactoryPort for NativeWatcherFactory {
         let watcher = tokio::select! {
             () = control.cancellation.cancelled() => return Err(HostError::cancelled("watcher initialization was cancelled")),
             () = deadline_wait(control.deadline) => return Err(HostError::deadline_exceeded("watcher initialization exceeded its deadline")),
-            result = initialization => result.map_err(watcher_error)??,
+            result = initialization => match result.map_err(watcher_error)? {
+                Ok(watcher) => Some(watcher),
+                Err(error) => {
+                    warn!(%error, "native watcher initialization failed; retrying in background");
+                    None
+                }
+            },
         };
         let (batch_sender, batch_receiver) = mpsc::channel(config.batch_capacity);
         let close = CancellationToken::new();
@@ -152,7 +158,7 @@ impl WorkspaceWatcherFactoryPort for NativeWatcherFactory {
             root,
             root_is_file: metadata.is_file(),
             config,
-            watcher: Some(watcher),
+            watcher,
             raw_sender,
             raw_receiver,
             overflowed,
@@ -292,11 +298,21 @@ async fn watch_loop(mut state: WatchLoop) {
         .resume_check_interval
         .map(|interval| Instant::now() + interval);
     let mut last_resume_check = Instant::now();
-    let mut retry_deadline = None;
-    let mut stable_deadline = Some(Instant::now() + Duration::from_secs(1));
-    let mut consecutive_errors = 0_u32;
-    let mut recovery_reconcile_pending = false;
+    let initialization_failed = state.watcher.is_none();
+    let mut retry_deadline = initialization_failed.then(|| Instant::now() + retry_delay(1));
+    let mut stable_deadline =
+        (!initialization_failed).then(|| Instant::now() + Duration::from_secs(1));
+    let mut consecutive_errors = u32::from(initialization_failed);
+    let mut recovery_reconcile_pending = initialization_failed;
     let mut pending_flush: Option<oneshot::Sender<()>> = None;
+    if initialization_failed {
+        changes.require_full_rescan();
+        schedule_flush(
+            &state.config,
+            &mut debounce_deadline,
+            &mut max_wait_deadline,
+        );
+    }
 
     loop {
         // Drain delivered raw events before acknowledging a reader's barrier.
@@ -307,9 +323,19 @@ async fn watch_loop(mut state: WatchLoop) {
                 || retry_deadline.is_some()
             {
                 changes.require_full_rescan();
-                if let Err(error) = refresh_watcher(&mut state).await {
-                    warn!(%error, "could not refresh watcher registrations at reader barrier");
-                    retry_deadline = Some(Instant::now() + retry_delay(consecutive_errors));
+                match refresh_watcher(&mut state).await {
+                    Ok(()) if state.watcher.is_some() && consecutive_errors > 0 => {
+                        retry_deadline = None;
+                        stable_deadline = Some(Instant::now() + Duration::from_secs(1));
+                    }
+                    Ok(()) => {}
+                    Err(error) => {
+                        warn!(%error, "could not refresh watcher registrations at reader barrier");
+                        consecutive_errors = consecutive_errors.saturating_add(1);
+                        stable_deadline = None;
+                        retry_deadline = Some(Instant::now() + retry_delay(consecutive_errors));
+                        recovery_reconcile_pending = true;
+                    }
                 }
             }
             if !flush_changes(&mut changes, &state.batch_sender, &state.close).await {
@@ -443,13 +469,24 @@ async fn watch_loop(mut state: WatchLoop) {
                             Ok((watcher, Err(error))) => {
                                 warn!(%error, "native watcher event policy failed");
                                 state.watcher = watcher;
+                                consecutive_errors = consecutive_errors.saturating_add(1);
+                                stable_deadline = None;
                                 retry_deadline = Some(Instant::now() + retry_delay(consecutive_errors));
-                                changes.require_full_rescan();
+                                if !recovery_reconcile_pending {
+                                    recovery_reconcile_pending = true;
+                                    changes.require_full_rescan();
+                                }
                             }
                             Err(error) => {
                                 warn!(%error, "native watcher event worker failed");
+                                state.watcher.take();
+                                consecutive_errors = consecutive_errors.saturating_add(1);
+                                stable_deadline = None;
                                 retry_deadline = Some(Instant::now() + retry_delay(consecutive_errors));
-                                changes.require_full_rescan();
+                                if !recovery_reconcile_pending {
+                                    recovery_reconcile_pending = true;
+                                    changes.require_full_rescan();
+                                }
                             }
                         }
                         if !changes.is_empty() {
@@ -471,10 +508,29 @@ async fn watch_loop(mut state: WatchLoop) {
                 }
             }
         }
-        if refresh_registration && let Err(error) = refresh_watcher(&mut state).await {
-            warn!(%error, "could not reconcile watcher registrations");
-            consecutive_errors = consecutive_errors.saturating_add(1);
-            retry_deadline = Some(Instant::now() + retry_delay(consecutive_errors));
+        if refresh_registration {
+            match refresh_watcher(&mut state).await {
+                Ok(()) if state.watcher.is_some() && consecutive_errors > 0 => {
+                    retry_deadline = None;
+                    stable_deadline = Some(Instant::now() + Duration::from_secs(1));
+                }
+                Ok(()) => {}
+                Err(error) => {
+                    warn!(%error, "could not reconcile watcher registrations");
+                    consecutive_errors = consecutive_errors.saturating_add(1);
+                    stable_deadline = None;
+                    retry_deadline = Some(Instant::now() + retry_delay(consecutive_errors));
+                    if !recovery_reconcile_pending {
+                        recovery_reconcile_pending = true;
+                        changes.require_full_rescan();
+                        schedule_flush(
+                            &state.config,
+                            &mut debounce_deadline,
+                            &mut max_wait_deadline,
+                        );
+                    }
+                }
+            }
         }
     }
     state.watcher.take();
@@ -1111,6 +1167,17 @@ mod tests {
     use crate::PathPolicy;
     use notify::event::CreateKind;
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn watcher_recovery_uses_node_backoff_schedule() {
+        let expected = [100, 200, 400, 800, 1_600, 3_200, 5_000, 5_000];
+        assert_eq!(
+            (1..=8)
+                .map(|attempt| retry_delay(attempt).as_millis())
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
 
     #[derive(Debug)]
     struct TestPolicy {

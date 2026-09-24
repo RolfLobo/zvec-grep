@@ -162,40 +162,24 @@ impl InstanceLock {
         let daemon_dir = daemon_dir(&config.home);
         create_private_dir(&daemon_dir)?;
         let path = daemon_dir.join(INSTANCE_FILE);
-        for _ in 0..3 {
-            let now = epoch_millis();
-            let record = DaemonInstanceRecord {
-                pid: std::process::id(),
-                hostname: hostname(),
-                instance_token: Uuid::new_v4(),
-                started_at: now,
-                updated_at: now,
-                server_url: config.listen.server_url(),
-                listen: config.listen.to_string(),
-                ready: false,
-                mcp_toolset: config.mcp_toolset.unwrap_or_default().to_string(),
-            };
-            match OpenOptions::new().write(true).create_new(true).open(&path) {
-                Ok(mut file) => {
-                    set_private_file(&file)?;
-                    serde_json::to_writer(&mut file, &record)?;
-                    file.write_all(b"\n")?;
-                    file.sync_all()?;
-                    return Ok(Self { path, record });
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if let Some(existing) = read_instance_record_path(&path).await?
-                        && existing.hostname == hostname()
-                        && process_is_alive(existing.pid)
-                    {
-                        return Err(DaemonError::AlreadyRunning { pid: existing.pid });
-                    }
-                    remove_file_if_exists(&path).await?;
-                }
-                Err(error) => return Err(error.into()),
-            }
-        }
-        Err(DaemonError::InvalidRecord(path))
+        let now = epoch_millis();
+        let record = DaemonInstanceRecord {
+            pid: std::process::id(),
+            hostname: hostname(),
+            instance_token: Uuid::new_v4(),
+            started_at: now,
+            updated_at: now,
+            server_url: config.listen.server_url(),
+            listen: config.listen.to_string(),
+            ready: false,
+            mcp_toolset: config.mcp_toolset.unwrap_or_default().to_string(),
+        };
+        let candidate =
+            path.with_file_name(format!("{INSTANCE_FILE}.{}.tmp", record.instance_token));
+        write_instance_record_file(&candidate, &record)?;
+        let result = acquire_instance_record(&path, &candidate).await;
+        let _ = remove_file_if_exists(&candidate).await;
+        result.map(|()| Self { path, record })
     }
 
     pub(crate) async fn mark_ready(&mut self) -> Result<(), DaemonError> {
@@ -207,9 +191,7 @@ impl InstanceLock {
                 pid: self.record.pid,
             });
         }
-        let bytes = serde_json::to_vec(&self.record)?;
-        tokio::fs::write(&self.path, [bytes.as_slice(), b"\n"].concat()).await?;
-        set_private_path(&self.path)?;
+        replace_instance_record(&self.path, &self.record).await?;
         Ok(())
     }
 
@@ -220,6 +202,94 @@ impl InstanceLock {
         }
         Ok(())
     }
+}
+
+async fn acquire_instance_record(path: &Path, candidate: &Path) -> Result<(), DaemonError> {
+    for _ in 0..3 {
+        match std::fs::hard_link(candidate, path) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                match read_instance_record_path(path).await {
+                    Ok(Some(existing))
+                        if existing.hostname == hostname() && process_is_alive(existing.pid) =>
+                    {
+                        return Err(DaemonError::AlreadyRunning { pid: existing.pid });
+                    }
+                    Ok(_) | Err(DaemonError::InvalidRecord(_)) => {
+                        remove_file_if_exists(path).await?;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(DaemonError::InvalidRecord(path.to_owned()))
+}
+
+fn write_instance_record_file(
+    path: &Path,
+    record: &DaemonInstanceRecord,
+) -> Result<(), DaemonError> {
+    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    set_private_file(&file)?;
+    serde_json::to_writer(&mut file, record)?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    Ok(())
+}
+
+async fn replace_instance_record(
+    path: &Path,
+    record: &DaemonInstanceRecord,
+) -> Result<(), DaemonError> {
+    const RETRY_DELAYS: [Duration; 7] = [
+        Duration::from_millis(5),
+        Duration::from_millis(10),
+        Duration::from_millis(20),
+        Duration::from_millis(40),
+        Duration::from_millis(80),
+        Duration::from_millis(160),
+        Duration::from_millis(320),
+    ];
+
+    let candidate = path.with_file_name(format!("{INSTANCE_FILE}.{}.tmp", Uuid::new_v4()));
+    write_instance_record_file(&candidate, record)?;
+    for delay in RETRY_DELAYS {
+        match std::fs::rename(&candidate, path) {
+            Ok(()) => return Ok(()),
+            Err(error) if retryable_replace_error(&error) => {
+                tokio::time::sleep(delay).await;
+            }
+            Err(error) => {
+                let _ = std::fs::remove_file(candidate);
+                return Err(error.into());
+            }
+        }
+    }
+    let result = std::fs::rename(&candidate, path).map_err(DaemonError::from);
+    if result.is_err() {
+        let _ = std::fs::remove_file(candidate);
+    }
+    result
+}
+
+fn retryable_replace_error(error: &std::io::Error) -> bool {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::AlreadyExists
+    ) {
+        return true;
+    }
+    #[cfg(unix)]
+    if error.raw_os_error() == Some(16) {
+        return true;
+    }
+    #[cfg(windows)]
+    if matches!(error.raw_os_error(), Some(32 | 33)) {
+        return true;
+    }
+    false
 }
 
 /// Starts the configured daemon process or returns the existing ready process.
@@ -661,15 +731,6 @@ fn set_private_file(file: &std::fs::File) -> Result<(), std::io::Error> {
     Ok(())
 }
 
-fn set_private_path(path: &Path) -> Result<(), std::io::Error> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(())
-}
-
 async fn remove_file_if_exists(path: &Path) -> Result<(), std::io::Error> {
     match tokio::fs::remove_file(path).await {
         Ok(()) => Ok(()),
@@ -682,7 +743,8 @@ async fn remove_file_if_exists(path: &Path) -> Result<(), std::io::Error> {
 mod tests {
     use tempfile::TempDir;
 
-    use super::{DaemonInstanceRecord, read_instance_record};
+    use super::{DaemonInstanceRecord, InstanceLock, instance_path, read_instance_record};
+    use crate::ServerConfig;
 
     #[tokio::test]
     async fn missing_instance_record_is_stopped() {
@@ -691,5 +753,44 @@ mod tests {
             .await
             .expect("record read should succeed");
         assert!(record.is_none());
+    }
+
+    #[tokio::test]
+    async fn instance_lock_replaces_an_incomplete_record_with_complete_states() {
+        let home = TempDir::new().expect("temp home");
+        let config = ServerConfig::new(
+            "127.0.0.1:7999".parse().expect("listen address"),
+            home.path().to_owned(),
+        );
+        let path = instance_path(home.path());
+        std::fs::create_dir_all(path.parent().expect("daemon directory"))
+            .expect("daemon directory");
+        std::fs::write(&path, b"{").expect("incomplete record");
+
+        let mut lock = InstanceLock::acquire(&config).await.expect("instance lock");
+        let starting = read_instance_record(home.path())
+            .await
+            .expect("starting record")
+            .expect("starting record exists");
+        assert!(!starting.ready);
+
+        lock.mark_ready().await.expect("ready record");
+        let ready = read_instance_record(home.path())
+            .await
+            .expect("ready record")
+            .expect("ready record exists");
+        assert!(ready.ready);
+        assert_eq!(ready.instance_token, starting.instance_token);
+        assert!(
+            std::fs::read_dir(path.parent().expect("daemon directory"))
+                .expect("daemon files")
+                .all(|entry| !entry
+                    .expect("daemon file")
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".tmp"))
+        );
+
+        lock.release().await.expect("release instance lock");
     }
 }

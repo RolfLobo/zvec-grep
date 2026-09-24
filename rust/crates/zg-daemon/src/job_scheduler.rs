@@ -729,17 +729,35 @@ fn job_error(error: EngineError) -> JobError {
 }
 
 fn redact_job_error_text(message: &str) -> String {
-    let mut redacted = redact_bearer_credentials(message);
+    let mut redacted = redact_url_userinfo(message);
+    redacted = redact_assigned_value(&redacted, "authorization", true);
+    for scheme in ["bearer", "basic"] {
+        redacted = redact_auth_scheme(&redacted, scheme);
+    }
     for name in [
-        "authorization",
+        "access_token",
+        "access-token",
+        "access token",
+        "accesstoken",
+        "refresh_token",
+        "refresh-token",
+        "refresh token",
+        "refreshtoken",
+        "id_token",
+        "id-token",
+        "id token",
+        "idtoken",
         "api_key",
         "api-key",
         "api key",
         "apikey",
+        "password",
+        "secret",
         "token",
     ] {
-        redacted = redact_assigned_value(&redacted, name);
+        redacted = redact_assigned_value(&redacted, name, false);
     }
+    redacted = redact_openai_keys(&redacted);
     let mut truncated = redacted
         .chars()
         .take(MAX_PERSISTED_ERROR_CHARS)
@@ -750,18 +768,56 @@ fn redact_job_error_text(message: &str) -> String {
     truncated
 }
 
-fn redact_bearer_credentials(message: &str) -> String {
+fn redact_url_userinfo(message: &str) -> String {
+    let mut output = message.to_owned();
+    let mut cursor = 0;
+    loop {
+        let Some(relative_marker) = output[cursor..].find("://") else {
+            return output;
+        };
+        let marker = cursor + relative_marker;
+        let mut scheme_start = marker;
+        while scheme_start > 0
+            && (output.as_bytes()[scheme_start - 1].is_ascii_alphanumeric()
+                || matches!(output.as_bytes()[scheme_start - 1], b'+' | b'.' | b'-'))
+        {
+            scheme_start -= 1;
+        }
+        let valid_scheme = scheme_start < marker
+            && output.as_bytes()[scheme_start].is_ascii_alphabetic()
+            && (scheme_start == 0
+                || !matches!(
+                    output.as_bytes()[scheme_start - 1],
+                    b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'+' | b'.' | b'-'
+                ));
+        let authority_start = marker + 3;
+        let authority_end = output.as_bytes()[authority_start..]
+            .iter()
+            .position(|byte| byte.is_ascii_whitespace() || *byte == b'/')
+            .map_or(output.len(), |offset| authority_start + offset);
+        if valid_scheme && let Some(relative_at) = output[authority_start..authority_end].find('@')
+        {
+            let userinfo_end = authority_start + relative_at;
+            output.replace_range(authority_start..userinfo_end, REDACTED);
+            cursor = authority_start + REDACTED.len() + 1;
+        } else {
+            cursor = authority_start;
+        }
+    }
+}
+
+fn redact_auth_scheme(message: &str, scheme: &str) -> String {
     let mut output = message.to_owned();
     let mut cursor = 0;
     loop {
         let lowercase = output.to_ascii_lowercase();
-        let Some(relative_start) = lowercase[cursor..].find("bearer") else {
+        let Some(relative_start) = lowercase[cursor..].find(scheme) else {
             return output;
         };
         let marker_start = cursor + relative_start;
-        let marker_end = marker_start + "bearer".len();
+        let marker_end = marker_start + scheme.len();
         let before_is_word =
-            marker_start > 0 && lowercase.as_bytes()[marker_start - 1].is_ascii_alphanumeric();
+            marker_start > 0 && is_identifier_byte(lowercase.as_bytes()[marker_start - 1]);
         let after_is_space = lowercase
             .as_bytes()
             .get(marker_end)
@@ -771,7 +827,7 @@ fn redact_bearer_credentials(message: &str) -> String {
             continue;
         }
         let value_start = skip_ascii_whitespace(output.as_bytes(), marker_end);
-        let value_end = credential_end(output.as_bytes(), value_start);
+        let value_end = quoted_or_token_end(output.as_bytes(), value_start);
         if value_start == value_end {
             cursor = marker_end;
             continue;
@@ -781,7 +837,7 @@ fn redact_bearer_credentials(message: &str) -> String {
     }
 }
 
-fn redact_assigned_value(message: &str, name: &str) -> String {
+fn redact_assigned_value(message: &str, name: &str, allow_spaces: bool) -> String {
     let mut output = message.to_owned();
     let mut cursor = 0;
     loop {
@@ -802,7 +858,15 @@ fn redact_assigned_value(message: &str, name: &str) -> String {
             cursor = name_end;
             continue;
         }
-        let separator = skip_ascii_whitespace(output.as_bytes(), name_end);
+        let mut separator = name_end;
+        if output
+            .as_bytes()
+            .get(separator)
+            .is_some_and(|byte| matches!(byte, b'\'' | b'"'))
+        {
+            separator += 1;
+        }
+        separator = skip_ascii_whitespace(output.as_bytes(), separator);
         if !output
             .as_bytes()
             .get(separator)
@@ -812,13 +876,47 @@ fn redact_assigned_value(message: &str, name: &str) -> String {
             continue;
         }
         let value_start = skip_ascii_whitespace(output.as_bytes(), separator + 1);
-        let value_end = credential_end(output.as_bytes(), value_start);
+        let value_end = if allow_spaces {
+            quoted_or_line_end(output.as_bytes(), value_start)
+        } else {
+            quoted_or_assigned_value_end(output.as_bytes(), value_start)
+        };
         if value_start == value_end {
             cursor = name_end;
             continue;
         }
         output.replace_range(value_start..value_end, REDACTED);
         cursor = value_start + REDACTED.len();
+    }
+}
+
+fn redact_openai_keys(message: &str) -> String {
+    let mut output = message.to_owned();
+    let mut cursor = 0;
+    loop {
+        let lowercase = output.to_ascii_lowercase();
+        let Some(relative_start) = lowercase[cursor..].find("sk-") else {
+            return output;
+        };
+        let start = cursor + relative_start;
+        if start > 0 && is_identifier_byte(lowercase.as_bytes()[start - 1]) {
+            cursor = start + 3;
+            continue;
+        }
+        let mut end = start + 3;
+        while output
+            .as_bytes()
+            .get(end)
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        {
+            end += 1;
+        }
+        if end - (start + 3) < 8 {
+            cursor = end;
+            continue;
+        }
+        output.replace_range(start..end, "sk-[redacted]");
+        cursor = start + "sk-[redacted]".len();
     }
 }
 
@@ -829,14 +927,60 @@ fn skip_ascii_whitespace(bytes: &[u8], mut cursor: usize) -> usize {
     cursor
 }
 
-fn credential_end(bytes: &[u8], mut cursor: usize) -> usize {
-    while bytes
-        .get(cursor)
-        .is_some_and(|byte| !byte.is_ascii_whitespace() && !matches!(byte, b',' | b';'))
-    {
-        cursor += 1;
+fn quoted_or_token_end(bytes: &[u8], cursor: usize) -> usize {
+    quoted_end(bytes, cursor).unwrap_or_else(|| {
+        let mut end = cursor;
+        while bytes.get(end).is_some_and(|byte| {
+            !byte.is_ascii_whitespace() && !matches!(byte, b'"' | b'\'' | b',' | b';' | b'&')
+        }) {
+            end += 1;
+        }
+        end
+    })
+}
+
+fn quoted_or_assigned_value_end(bytes: &[u8], cursor: usize) -> usize {
+    quoted_end(bytes, cursor).unwrap_or_else(|| {
+        let mut end = cursor;
+        while bytes
+            .get(end)
+            .is_some_and(|byte| !byte.is_ascii_whitespace() && *byte != b'&')
+        {
+            end += 1;
+        }
+        end
+    })
+}
+
+fn quoted_or_line_end(bytes: &[u8], cursor: usize) -> usize {
+    quoted_end(bytes, cursor).unwrap_or_else(|| {
+        let mut end = cursor;
+        while bytes
+            .get(end)
+            .is_some_and(|byte| !matches!(byte, b'\r' | b'\n'))
+        {
+            end += 1;
+        }
+        end
+    })
+}
+
+fn quoted_end(bytes: &[u8], cursor: usize) -> Option<usize> {
+    let quote @ (b'\'' | b'"') = *bytes.get(cursor)? else {
+        return None;
+    };
+    let mut end = cursor + 1;
+    while let Some(byte) = bytes.get(end) {
+        if *byte == b'\\' {
+            end = (end + 2).min(bytes.len());
+        } else {
+            end += 1;
+            if *byte == quote {
+                break;
+            }
+        }
     }
-    cursor
+    Some(end)
 }
 
 fn is_identifier_byte(byte: u8) -> bool {
@@ -919,6 +1063,7 @@ mod tests {
 
     use super::{
         IndexExecutor, IndexJobScheduler, JobReason, JobState, SchedulerConfig, SchedulerError,
+        redact_job_error_text,
     };
 
     struct GatedExecutor {
@@ -2257,6 +2402,48 @@ mod tests {
                 .job
                 .state,
             JobState::Succeeded
+        );
+    }
+
+    #[test]
+    fn persisted_error_redaction_matches_node_credential_forms() {
+        let secret = "https://user:pass@example.test Basic basic-secret password='password secret' access-token=access-secret refresh_token=refresh-secret id token=id-secret secret=plain-secret sk-12345678";
+        let redacted = redact_job_error_text(secret);
+
+        for credential in [
+            "user:pass",
+            "basic-secret",
+            "password secret",
+            "access-secret",
+            "refresh-secret",
+            "id-secret",
+            "plain-secret",
+            "sk-12345678",
+        ] {
+            assert!(!redacted.contains(credential), "leaked {credential}");
+        }
+        assert_eq!(redacted.matches("[redacted]").count(), 8);
+    }
+
+    #[test]
+    fn assigned_credentials_include_punctuation_until_whitespace_or_ampersand() {
+        assert_eq!(
+            redact_job_error_text(
+                "password=abc,def;ghi status=401 api_key=jkl,mno;pqr&other=retained"
+            ),
+            "password=[redacted] status=401 api_key=[redacted]&other=retained"
+        );
+    }
+
+    #[test]
+    fn authorization_assignment_redacts_the_complete_line() {
+        assert_eq!(
+            redact_job_error_text("authorization: custom value with spaces\nvisible"),
+            "authorization: [redacted]\nvisible"
+        );
+        assert_eq!(
+            redact_job_error_text(r#"{"authorization": "Basic quoted secret", "safe": true}"#),
+            r#"{"authorization": [redacted], "safe": true}"#
         );
     }
 

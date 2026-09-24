@@ -126,6 +126,29 @@ async fn pending_flush_drains_delivered_events_without_promoting_them_to_rescan(
     fixture.close().await;
 }
 
+#[tokio::test(start_paused = true)]
+async fn failed_initial_registration_recovers_in_the_background() {
+    let mut fixture = Fixture::new(false);
+
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_millis(100)).await;
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    fixture.flush(false).await;
+    assert_eq!(
+        fixture
+            .batches
+            .try_recv()
+            .expect("recovery reconciliation")
+            .changes,
+        [WorkspaceChange::Rescan]
+    );
+    fixture.flush(false).await;
+    assert!(fixture.batches.try_recv().is_err());
+    fixture.close().await;
+}
+
 #[tokio::test]
 async fn pending_flush_preserves_overflow_and_backend_failure_reconciliation() {
     let mut fixture = Fixture::new(true);

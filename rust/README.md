@@ -248,10 +248,11 @@ Public search reports `freshness: fresh` or `freshness: possibly_stale`.
 index provenance without verified freshness is conservatively shown as
 `possibly_stale`; a successful waited refresh reports `fresh`.
 
-Both HTTP and stdio expose the same tools. Search accepts `device`; index accepts
-`debug: true` to return completed statistics, timings and at most 100 skipped files.
-Use `wait: true` to obtain these diagnostics in the index response; background
-submissions return job state instead of pretending that indexing has completed.
+Both HTTP and stdio expose the same tools. Public search rejects per-request
+`device` and `apiKey` overrides. Index accepts `device` and `debug: true` to return
+completed statistics, timings and at most 100 skipped files. Use `wait: true` to
+obtain these diagnostics in the index response; background submissions return job
+state instead of pretending that indexing has completed.
 
 Index and search requests carrying `_meta.progressToken` receive coalesced MCP
 progress notifications during indexing, synchronous refresh and model download.

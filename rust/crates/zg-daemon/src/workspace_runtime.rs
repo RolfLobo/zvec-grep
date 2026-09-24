@@ -58,7 +58,7 @@ struct RuntimeManagerInner {
     runtimes: Mutex<HashMap<PathBuf, Arc<WorkspaceRuntime>>>,
     shutdown: CancellationToken,
     closed: AtomicBool,
-    idle_ttl: std::time::Duration,
+    idle_ttl: Option<std::time::Duration>,
     maintenance: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -230,20 +230,44 @@ impl WorkspaceWatcherFactoryPort for EngineWatcherFactory {
 }
 
 impl WorkspaceRuntimeManager {
+    #[cfg(test)]
     pub(crate) fn native(engine: Arc<ZvecGrep>) -> Self {
-        Self::new(
+        Self::native_with_idle_ttl(engine, Some(Self::DEFAULT_IDLE_TTL))
+    }
+
+    pub(crate) fn native_with_idle_ttl(
+        engine: Arc<ZvecGrep>,
+        idle_ttl: Option<std::time::Duration>,
+    ) -> Self {
+        Self::new_with_idle_ttl(
             Arc::new(ZvecGrepIndexExecutor {
                 engine: Arc::clone(&engine),
             }),
             Arc::new(EngineWatcherFactory { engine }),
             SchedulerConfig::default(),
+            idle_ttl,
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn new(
         executor: Arc<dyn IndexExecutor>,
         watcher_factory: Arc<dyn WorkspaceWatcherFactoryPort>,
         scheduler_config: SchedulerConfig,
+    ) -> Self {
+        Self::new_with_idle_ttl(
+            executor,
+            watcher_factory,
+            scheduler_config,
+            Some(Self::DEFAULT_IDLE_TTL),
+        )
+    }
+
+    pub(crate) fn new_with_idle_ttl(
+        executor: Arc<dyn IndexExecutor>,
+        watcher_factory: Arc<dyn WorkspaceWatcherFactoryPort>,
+        scheduler_config: SchedulerConfig,
+        idle_ttl: Option<std::time::Duration>,
     ) -> Self {
         Self {
             inner: Arc::new(RuntimeManagerInner {
@@ -253,7 +277,7 @@ impl WorkspaceRuntimeManager {
                 runtimes: Mutex::new(HashMap::new()),
                 shutdown: CancellationToken::new(),
                 closed: AtomicBool::new(false),
-                idle_ttl: Self::DEFAULT_IDLE_TTL,
+                idle_ttl,
                 maintenance: Mutex::new(None),
             }),
         }

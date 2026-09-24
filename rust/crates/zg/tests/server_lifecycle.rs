@@ -1441,7 +1441,9 @@ fn stdio_remote_consent_controls_transmission_and_persistence() -> Result<(), Bo
     )?;
     let signing_key = home.path().join("authorization.key");
     let (mut guard, _) = start_server(&binary, &home, "full", None, |command| {
-        command.env("ZVEC_GREP_AUTHORIZATION_KEY_FILE", &signing_key);
+        command
+            .env("ZVEC_GREP_AUTHORIZATION_KEY_FILE", &signing_key)
+            .env("ZVEC_GREP_API_KEY", "test-key");
     })?;
     let mut bridge = StdioBridge::spawn(&binary, home.path(), &guard.listen)?;
     bridge.request(
@@ -1481,7 +1483,7 @@ fn stdio_remote_consent_controls_transmission_and_persistence() -> Result<(), Bo
     );
     let search = |id| {
         json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {
-            "name": "zvec_grep_search", "arguments": {"root": workspace.path(), "query": "consent", "autoUpdate": false, "apiKey": "test-key"}
+            "name": "zvec_grep_search", "arguments": {"root": workspace.path(), "query": "consent", "autoUpdate": false}
         }})
     };
     let (fts, prompts) = bridge.request_with_consent(&search(4), "fts_only")?;

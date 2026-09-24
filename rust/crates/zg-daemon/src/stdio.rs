@@ -66,6 +66,7 @@ where
         tokio::time::Instant::now() + DAEMON_MONITOR_INTERVAL,
         DAEMON_MONITOR_INTERVAL,
     );
+    let mut stop_check = StdioBridgeStopCheck::default();
 
     let relay_result = loop {
         tokio::select! {
@@ -98,11 +99,8 @@ where
                 }
             }
             _ = monitor.tick() => {
-                let current = match server_status(home).await {
-                    Ok(current) => current,
-                    Err(error) => break Err(error),
-                };
-                if !same_daemon(connected, &current) {
+                let current = server_status(home).await.unwrap_or_default();
+                if stop_check.should_stop(connected, &current) {
                     break Err(DaemonError::McpBridge(
                         "daemon stopped or changed while stdio was connected".to_owned(),
                     ));
@@ -130,6 +128,22 @@ async fn send_next<E>(sends: &mut VecDeque<BoxFuture<'static, Result<(), E>>>) -
     let result = send.await;
     sends.pop_front();
     result
+}
+
+#[derive(Default)]
+struct StdioBridgeStopCheck {
+    consecutive_missing: u8,
+}
+
+impl StdioBridgeStopCheck {
+    fn should_stop(&mut self, connected: &DaemonStatus, current: &DaemonStatus) -> bool {
+        if !current.running {
+            self.consecutive_missing = self.consecutive_missing.saturating_add(1);
+            return self.consecutive_missing >= 3;
+        }
+        self.consecutive_missing = 0;
+        !same_daemon(connected, current)
+    }
 }
 
 fn same_daemon(connected: &DaemonStatus, current: &DaemonStatus) -> bool {

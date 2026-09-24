@@ -615,11 +615,6 @@ pub struct SearchInput {
     /// Absolute workspace root visible to the daemon.
     #[schemars(length(min = 1, max = 1024))]
     pub root: String,
-    /// One-request embedding provider API key override.
-    #[schemars(length(min = 1, max = 8192))]
-    pub api_key: Option<String>,
-    /// One-request local embedding device override.
-    pub device: Option<DeviceInput>,
     /// One primary hybrid-search group.
     #[schemars(length(max = 4000))]
     pub query: Option<String>,
@@ -1162,9 +1157,6 @@ fn normalize_filter_names<T>(
 impl SearchInput {
     fn into_request(self) -> Result<ContextOptions, String> {
         let root = absolute_root(&self.root)?;
-        if let Some(api_key) = &self.api_key {
-            validate_text("apiKey", api_key, 1, 8_192)?;
-        }
         if self
             .limit
             .is_some_and(|limit| limit == 0 || limit > MAX_SEARCH_LIMIT)
@@ -1236,8 +1228,6 @@ impl SearchInput {
                 )?,
                 symbol_types: self.symbol_types.into_iter().map(Into::into).collect(),
             },
-            api_key: self.api_key,
-            device: self.device.map(Into::into),
             embedding_concurrency: self.embedding_concurrency,
             ..ContextOptions::default()
         };
@@ -1513,7 +1503,11 @@ fn scan_rg_command(command: &str) -> Result<Vec<String>, String> {
             continue;
         }
         if character == '\\' {
-            escaping = true;
+            if cfg!(windows) {
+                token.push(character);
+            } else {
+                escaping = true;
+            }
             token_started = true;
             continue;
         }
@@ -2023,8 +2017,6 @@ mod tests {
     fn input() -> SearchInput {
         SearchInput {
             root: test_root().display().to_string(),
-            api_key: None,
-            device: None,
             query: Some("call chain".to_owned()),
             queries: None,
             fts: Some(QueryListInput::One("run".to_owned())),
@@ -2213,13 +2205,33 @@ mod tests {
     }
 
     #[test]
-    fn search_accepts_all_supported_devices() {
+    fn public_search_rejects_runtime_overrides() {
+        let schema =
+            serde_json::to_value(schemars::schema_for!(SearchInput)).expect("search schema");
+        assert!(schema["properties"].get("apiKey").is_none());
+        assert!(schema["properties"].get("device").is_none());
+
+        for (field, value) in [("apiKey", "secret"), ("device", "cpu")] {
+            assert!(
+                serde_json::from_value::<SearchInput>(serde_json::json!({
+                    "root": test_root(), "query": "needle", (field): value
+                }))
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn index_accepts_all_supported_devices() {
         for device in ["auto", "cpu", "metal", "vulkan", "cuda"] {
-            let mut search = input();
-            search.device =
-                Some(serde_json::from_value(serde_json::json!(device)).expect("device"));
-            let request = search.into_request().expect("device should map");
-            assert_eq!(serde_json::json!(request.device), device);
+            let mut index = index_input();
+            index.device = Some(serde_json::from_value(serde_json::json!(device)).expect("device"));
+            let IndexToolRequest::Index { options, .. } =
+                index.into_request().expect("device should map")
+            else {
+                panic!("index options should create an index request");
+            };
+            assert_eq!(serde_json::json!(options.device), device);
         }
     }
 
@@ -2542,6 +2554,24 @@ mod tests {
                 .expect("required properties")
                 .iter()
                 .any(|field| field == "name")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rg_command_preserves_unquoted_windows_path_separators() {
+        assert_eq!(
+            super::scan_rg_command(r"rg needle src\cli").expect("managed rg command"),
+            ["rg", "needle", r"src\cli"]
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn rg_command_preserves_unquoted_shell_escapes() {
+        assert_eq!(
+            super::scan_rg_command(r"rg needle src\ cli").expect("managed rg command"),
+            ["rg", "needle", "src cli"]
         );
     }
 

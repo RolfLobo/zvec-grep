@@ -78,6 +78,7 @@ pub(crate) async fn run_server(
     engine: Arc<ZvecGrep>,
     init_logging: impl FnOnce(&std::path::Path) -> Result<(), DaemonError>,
 ) -> Result<(), DaemonError> {
+    let idle_ttl = crate::configured_watcher_idle_timeout()?;
     engine.enable_read_session_cache()?;
     let token = crate::resolve_token(config.token_file.as_deref())?;
     let mut instance = InstanceLock::acquire(&config).await?;
@@ -100,7 +101,7 @@ pub(crate) async fn run_server(
         }
     };
     let shutdown = CancellationToken::new();
-    let runtimes = WorkspaceRuntimeManager::native(Arc::clone(&engine));
+    let runtimes = WorkspaceRuntimeManager::native_with_idle_ttl(Arc::clone(&engine), idle_ttl);
     let status: Arc<dyn ServerStatusProvider> = Arc::new(RuntimeStatusProvider {
         started: Instant::now(),
         shutdown: shutdown.clone(),

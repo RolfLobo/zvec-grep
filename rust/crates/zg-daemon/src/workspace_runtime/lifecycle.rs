@@ -75,16 +75,19 @@ impl Drop for RuntimeActivity {
 }
 
 impl WorkspaceRuntimeManager {
-    pub(super) const DEFAULT_IDLE_TTL: Duration = DEFAULT_IDLE_TTL;
+    pub(crate) const DEFAULT_IDLE_TTL: Duration = DEFAULT_IDLE_TTL;
 
     pub(super) fn start_maintenance(&self) {
+        let Some(idle_ttl) = self.inner.idle_ttl else {
+            return;
+        };
         let mut task = lock(&self.inner.maintenance);
         if task.is_some() || self.inner.closed.load(std::sync::atomic::Ordering::Acquire) {
             return;
         }
         let weak = Arc::downgrade(&self.inner);
         let shutdown = self.inner.shutdown.clone();
-        let interval = self.inner.idle_ttl.min(MAINTENANCE_INTERVAL);
+        let interval = idle_ttl.min(MAINTENANCE_INTERVAL);
         *task = Some(tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -99,13 +102,16 @@ impl WorkspaceRuntimeManager {
     }
 
     pub(super) async fn retire_idle(&self, now: Instant) {
+        let Some(idle_ttl) = self.inner.idle_ttl else {
+            return;
+        };
         let retired = {
             let mut runtimes = lock(&self.inner.runtimes);
             let mut retired = Vec::new();
             runtimes.retain(|root, runtime| {
                 let mut state = lock(&runtime.lifecycle);
                 if state.active != 0
-                    || now.saturating_duration_since(state.last_used) < self.inner.idle_ttl
+                    || now.saturating_duration_since(state.last_used) < idle_ttl
                     || self.inner.scheduler.has_active_root(root)
                 {
                     return true;
